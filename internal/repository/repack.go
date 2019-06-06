@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
+	"sync"
 
 	"github.com/restic/restic/internal/debug"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/pack"
 	"github.com/restic/restic/internal/restic"
+
+	tomb "gopkg.in/tomb.v2"
 )
 
 // Repack takes a list of packs together with a list of blobs contained in
@@ -19,96 +23,215 @@ import (
 func Repack(ctx context.Context, repo restic.Repository, packs restic.IDSet, keepBlobs restic.BlobSet, p *restic.Progress) (obsoletePacks restic.IDSet, err error) {
 	debug.Log("repacking %d packs while keeping %d blobs", len(packs), len(keepBlobs))
 
-	for packID := range packs {
-		// load the complete pack into a temp file
-		h := restic.Handle{Type: restic.DataFile, Name: packID.String()}
+	t, wctx := tomb.WithContext(ctx)
 
-		tempfile, hash, packLength, err := DownloadAndHash(ctx, repo.Backend(), h)
-		if err != nil {
-			return nil, errors.Wrap(err, "Repack")
+	p.Start()
+	defer p.Done()
+
+	type fetchJob struct {
+		packID restic.ID
+	}
+	fetchCh := make(chan fetchJob)
+
+	type readJob struct {
+		packID     restic.ID
+		packLength int64
+		tempfile   *os.File
+	}
+	readCh := make(chan readJob)
+
+	type saveJob struct {
+		entry     restic.Blob
+		plaintext []byte
+	}
+	saveCh := make(chan saveJob)
+
+	// Feed pack IDs to the rest of the pipeline
+	inputWorker := func() error {
+		for packID := range packs {
+			select {
+			case fetchCh <- fetchJob{packID: packID}:
+			case <-t.Dying():
+				break
+			}
 		}
+		close(fetchCh)
+		return nil
+	}
 
-		debug.Log("pack %v loaded (%d bytes), hash %v", packID, packLength, hash)
+	// Fetch packs from the repository
+	var fetchWG sync.WaitGroup
+	fetchWorker := func() error {
+		defer fetchWG.Done()
+		for job := range fetchCh {
+			// load the complete pack into a temp file
+			h := restic.Handle{Type: restic.DataFile, Name: job.packID.String()}
 
-		if !packID.Equal(hash) {
-			return nil, errors.Errorf("hash does not match id: want %v, got %v", packID, hash)
+			tempfile, hash, packLength, err := DownloadAndHash(wctx, repo.Backend(), h)
+			if err != nil {
+				return errors.Wrap(err, "Repack")
+			}
+
+			debug.Log("pack %v fetched (%d bytes), hash %v", job.packID, packLength, hash)
+
+			if !job.packID.Equal(hash) {
+				return errors.Errorf("hash does not match id: want %v, got %v", job.packID, hash)
+			}
+
+			_, err = tempfile.Seek(0, 0)
+			if err != nil {
+				return err
+			}
+
+			select {
+			case readCh <- readJob{packID: job.packID, packLength: packLength, tempfile: tempfile}:
+			case <-t.Dying():
+				return tomb.ErrDying
+			}
 		}
+		return nil
+	}
 
-		_, err = tempfile.Seek(0, 0)
-		if err != nil {
-			return nil, errors.Wrap(err, "Seek")
+	// Read the blobs from the downloaded pack files
+	var readWG sync.WaitGroup
+	readWorker := func() error {
+		defer readWG.Done()
+		for job := range readCh {
+			blobs, err := pack.List(repo.Key(), job.tempfile, job.packLength)
+			if err != nil {
+				return err
+			}
+
+			// TODO: use some kind of buffer pool?
+
+			// TODO: proper cleanup after error
+
+			debug.Log("processing pack %v, blobs: %v", job.packID, len(blobs))
+			for _, entry := range blobs {
+				h := restic.BlobHandle{ID: entry.ID, Type: entry.Type}
+				if !keepBlobs.Has(h) {
+					continue
+				}
+
+				debug.Log("  read blob %v", h)
+
+				buf := make([]byte, entry.Length)
+				n, err := job.tempfile.ReadAt(buf, int64(entry.Offset))
+				if err != nil {
+					return errors.Wrap(err, "ReadAt")
+				}
+
+				if n != len(buf) {
+					return errors.Errorf("read blob %v from %v: not enough bytes read, want %v, got %v",
+						h, job.tempfile.Name(), len(buf), n)
+				}
+
+				nonce, ciphertext := buf[:repo.Key().NonceSize()], buf[repo.Key().NonceSize():]
+				plaintext, err := repo.Key().Open(ciphertext[:0], nonce, ciphertext, nil)
+				if err != nil {
+					return err
+				}
+
+				id := restic.Hash(plaintext)
+				if !id.Equal(entry.ID) {
+					debug.Log("read blob %v/%v from %v: wrong data returned, hash is %v",
+						h.Type, h.ID, job.tempfile.Name(), id)
+					fmt.Fprintf(os.Stderr, "read blob %v from %v: wrong data returned, hash is %v",
+						h, job.tempfile.Name(), id)
+				}
+
+				select {
+				case saveCh <- saveJob{entry: entry, plaintext: plaintext}:
+				case <-t.Dying():
+					return tomb.ErrDying
+				}
+			}
+
+			if err = job.tempfile.Close(); err != nil {
+				return errors.Wrap(err, "Close")
+			}
+
+			if err = fs.RemoveIfExists(job.tempfile.Name()); err != nil {
+				return errors.Wrap(err, "Remove")
+			}
+
+			p.Report(restic.Stat{Blobs: 1})
 		}
+		return nil
+	}
 
-		blobs, err := pack.List(repo.Key(), tempfile, packLength)
-		if err != nil {
-			return nil, err
-		}
-
-		debug.Log("processing pack %v, blobs: %v", packID, len(blobs))
-		var buf []byte
-		for _, entry := range blobs {
-			h := restic.BlobHandle{ID: entry.ID, Type: entry.Type}
-			if !keepBlobs.Has(h) {
+	// Save the kept blobs back to the repository
+	var seenBlobs sync.Map
+	saveWorker := func() error {
+		for job := range saveCh {
+			h := restic.BlobHandle{Type: job.entry.Type, ID: job.entry.ID}
+			if _, found := seenBlobs.LoadOrStore(h, struct{}{}); found {
 				continue
 			}
 
-			debug.Log("  process blob %v", h)
-
-			buf = buf[:]
-			if uint(len(buf)) < entry.Length {
-				buf = make([]byte, entry.Length)
-			}
-			buf = buf[:entry.Length]
-
-			n, err := tempfile.ReadAt(buf, int64(entry.Offset))
+			debug.Log("write blob %v/%v", job.entry.Type, job.entry.ID)
+			id, err := repo.SaveBlob(wctx, job.entry.Type, job.plaintext, restic.ID{})
 			if err != nil {
-				return nil, errors.Wrap(err, "ReadAt")
+				return err
 			}
-
-			if n != len(buf) {
-				return nil, errors.Errorf("read blob %v from %v: not enough bytes read, want %v, got %v",
-					h, tempfile.Name(), len(buf), n)
+			if !id.Equal(job.entry.ID) {
+				debug.Log("wrote blob %v/%v: wrong data written, hash is %v",
+					job.entry.Type, job.entry.ID, id)
+				fmt.Fprintf(os.Stderr, "wrote blob %v: wrong data written, hash is %v",
+					h, id)
 			}
+			debug.Log("  saved blob %v", job.entry.ID)
 
-			nonce, ciphertext := buf[:repo.Key().NonceSize()], buf[repo.Key().NonceSize():]
-			plaintext, err := repo.Key().Open(ciphertext[:0], nonce, ciphertext, nil)
-			if err != nil {
-				return nil, err
+			select {
+			case <-t.Dying():
+				return tomb.ErrDying
+			default:
 			}
-
-			id := restic.Hash(plaintext)
-			if !id.Equal(entry.ID) {
-				debug.Log("read blob %v/%v from %v: wrong data returned, hash is %v",
-					h.Type, h.ID, tempfile.Name(), id)
-				fmt.Fprintf(os.Stderr, "read blob %v from %v: wrong data returned, hash is %v",
-					h, tempfile.Name(), id)
-			}
-
-			_, err = repo.SaveBlob(ctx, entry.Type, plaintext, entry.ID)
-			if err != nil {
-				return nil, err
-			}
-
-			debug.Log("  saved blob %v", entry.ID)
-
-			keepBlobs.Delete(h)
 		}
+		return nil
+	}
 
-		if err = tempfile.Close(); err != nil {
-			return nil, errors.Wrap(err, "Close")
-		}
+	t.Go(func() error {
+		t.Go(inputWorker)
 
-		if err = fs.RemoveIfExists(tempfile.Name()); err != nil {
-			return nil, errors.Wrap(err, "Remove")
+		fetchWorkers := repo.Backend().Connections()
+		fetchWG.Add(int(fetchWorkers))
+		for i := uint(0); i < fetchWorkers; i++ {
+			t.Go(fetchWorker)
 		}
-		if p != nil {
-			p.Report(restic.Stat{Blobs: 1})
+		t.Go(func() error {
+			fetchWG.Wait()
+			close(readCh)
+			return nil
+		})
+
+		readWorkers := runtime.GOMAXPROCS(0)
+		readWG.Add(readWorkers)
+		for i := 0; i < readWorkers; i++ {
+			t.Go(readWorker)
 		}
+		t.Go(func() error {
+			readWG.Wait()
+			close(saveCh)
+			return nil
+		})
+
+		saveWorkers := runtime.GOMAXPROCS(0)
+		for i := 0; i < saveWorkers; i++ {
+			t.Go(saveWorker)
+		}
+		return nil
+	})
+
+	if err := t.Wait(); err != nil {
+		return nil, err
 	}
 
 	if err := repo.Flush(ctx); err != nil {
 		return nil, err
 	}
+
+	debug.Log("finished repacking")
 
 	return packs, nil
 }

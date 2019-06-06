@@ -271,7 +271,7 @@ func BenchmarkIndexSave(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		ids, err := idx.Save(context.TODO(), repo, nil)
+		ids, err := idx.Save(context.TODO(), repo, nil, nil)
 		if err != nil {
 			b.Fatalf("New() returned error %v", err)
 		}
@@ -317,7 +317,7 @@ func TestIndexSave(t *testing.T) {
 
 	idx := loadIndex(t, repo)
 
-	ids, err := idx.Save(context.TODO(), repo, idx.IndexIDs.List())
+	ids, err := idx.Save(context.TODO(), repo, idx.IndexIDs.List(), nil)
 	if err != nil {
 		t.Fatalf("unable to save new index: %v", err)
 	}

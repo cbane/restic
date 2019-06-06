@@ -23,6 +23,7 @@ type Pack struct {
 
 // Index contains information about blobs and packs stored in a repo.
 type Index struct {
+	m        sync.Mutex
 	Packs    map[restic.ID]Pack
 	IndexIDs restic.IDSet
 }
@@ -258,6 +259,9 @@ func Load(ctx context.Context, repo ListLoader, p *restic.Progress) (*Index, err
 // AddPack adds a pack to the index. If this pack is already in the index, an
 // error is returned.
 func (idx *Index) AddPack(id restic.ID, size int64, entries []restic.Blob) error {
+	idx.m.Lock()
+	defer idx.m.Unlock()
+
 	if _, ok := idx.Packs[id]; ok {
 		return errors.Errorf("pack %v already present in the index", id.Str())
 	}
@@ -350,7 +354,10 @@ type Saver interface {
 }
 
 // Save writes the complete index to the repo.
-func (idx *Index) Save(ctx context.Context, repo Saver, supersedes restic.IDs) (restic.IDs, error) {
+func (idx *Index) Save(ctx context.Context, repo Saver, supersedes restic.IDs, prog *restic.Progress) (restic.IDs, error) {
+	prog.Start()
+	defer prog.Done()
+
 	debug.Log("pack files: %d\n", len(idx.Packs))
 
 	var indexIDs []restic.ID
@@ -387,6 +394,7 @@ func (idx *Index) Save(ctx context.Context, repo Saver, supersedes restic.IDs) (
 				return nil, err
 			}
 			debug.Log("saved new index as %v", id)
+			prog.Report(restic.Stat{Blobs: 1})
 
 			indexIDs = append(indexIDs, id)
 			packs = 0
@@ -400,6 +408,7 @@ func (idx *Index) Save(ctx context.Context, repo Saver, supersedes restic.IDs) (
 			return nil, err
 		}
 		debug.Log("saved new index as %v", id)
+		prog.Report(restic.Stat{Blobs: 1})
 		indexIDs = append(indexIDs, id)
 	}
 
